@@ -3162,7 +3162,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return Ok(false);
         }
         fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
-        if let Err(e) = fs::rename(staged, &blob) {
+        // Wait out a delete-pending destination. A concurrent remove that drops
+        // this blob's last reference leaves the name occupied on Windows until
+        // its handle closes, and publishing into it meanwhile fails with
+        // ERROR_ACCESS_DENIED — a race between two healthy operations, reported
+        // as a failed put (kunobi-ninja/kache Test (Windows)). Retrying inside
+        // the publish keeps the staged file alive for the next attempt, which
+        // is why this is not `discard_staged_blob` then retry.
+        if let Err(e) = crate::atomic::retry_transient_windows(|| fs::rename(staged, &blob)) {
             Self::discard_staged_blob(staged);
             // Re-stat: only a publish that lost a race finds the destination
             // occupied *now* having found it free above.
@@ -4309,19 +4316,31 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 meta_content = content;
                 meta.files.iter().map(|f| f.hash.clone()).collect()
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // No meta.json. A same-key operation may be mid-flight: a
-                // publisher materializes meta inside its registration
-                // transaction, and a removal's cleanup pass runs in its own
-                // locked transaction (#670) — so "meta missing, row present"
-                // can be a healthy transient, not only the stranded-entry
-                // shape. Bounce off the write lock — the no-op write statement
-                // waits (busy_timeout) until any in-flight writer commits or
-                // rolls back — then judge the settled state. Both the row and
-                // the meta are checked while the lock is still held: after
-                // dropping it another writer could move the pairing again and
-                // a healthy already-absent state would misreport as #276
-                // corruption.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || crate::atomic::is_transient_rename_error(&e) =>
+            {
+                // No readable meta.json. A same-key operation may be
+                // mid-flight: a publisher materializes meta inside its
+                // registration transaction, and a removal's cleanup pass runs
+                // in its own locked transaction (#670) — so "meta missing, row
+                // present" can be a healthy transient, not only the
+                // stranded-entry shape. Bounce off the write lock — the no-op
+                // write statement waits (busy_timeout) until any in-flight
+                // writer commits or rolls back — then judge the settled state.
+                // Both the row and the meta are checked while the lock is
+                // still held: after dropping it another writer could move the
+                // pairing again and a healthy already-absent state would
+                // misreport as #276 corruption.
+                //
+                // A concurrent remover that already unlinked this meta.json
+                // arrives here too. On Unix that read returns NotFound; on
+                // Windows the name lingers delete-pending and the read fails
+                // with ERROR_ACCESS_DENIED instead, which used to fall through
+                // to the unreadable-meta arm and report #276 corruption for two
+                // healthy removers. Both shapes mean the same thing — someone
+                // else is mid-operation — so both settle on the write lock
+                // rather than on a sleep.
                 let tx = self.db.unchecked_transaction()?;
                 tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
                 let row_exists: i64 = tx.query_row(
@@ -4329,6 +4348,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     params![cache_key],
                     |row| row.get(0),
                 )?;
+                if row_exists == 0 {
+                    // The concurrent removal won (or the key never existed);
+                    // nothing left to remove, and the meta's state cannot
+                    // change that — so decide before probing it, which on
+                    // Windows may still be delete-pending and unstattable.
+                    return Ok(RemovalAttempt::Done(None));
+                }
                 // fs::metadata, not Path::exists: exists() swallows every
                 // error as false, and a permission failure must refuse like
                 // the unreadable-meta arm below, not report already-absent.
@@ -4347,11 +4373,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     }
                 };
                 drop(tx);
-                if row_exists == 0 {
-                    // The concurrent removal won (or the key never existed);
-                    // nothing left to remove.
-                    return Ok(RemovalAttempt::Done(None));
-                }
                 if meta_is_back {
                     // A republication landed while we waited: the row belongs
                     // to a fresh generation whose meta is back. The caller
